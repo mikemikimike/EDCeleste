@@ -241,3 +241,28 @@ async def test_should_answer_the_next_message_after_a_failed_turn(edceleste):
                 "Celeste's answer after the failed turn",
             )
             assert comms_entries(pilot.app, "llm-response") == ["Copy that, Commander."]
+
+
+@allure.title("A rejected request does not expose the API key")
+async def test_rejected_request_redacts_the_key_in_comms_and_log(edceleste, caplog):
+    edceleste.settings.llm.provider.api_key = "secret-key"
+    edceleste.save_config()
+
+    async def reject(messages, agent_info):
+        raise RuntimeError("401 secret-key")
+        yield
+
+    edceleste.use_scripted_model(reject)
+    async with edceleste.run_app() as pilot:
+        await edceleste.boot_to_dashboard(pilot)
+        await send_comms_message(pilot, "hello")
+        await edceleste.wait_until(
+            pilot,
+            lambda: (
+                "LLM turn failed: 401 [REDACTED API KEY]"
+                in comms_entries(pilot.app, "system-message")
+            ),
+            "redacted failed turn in COMMS",
+        )
+        assert "secret-key" not in " ".join(comms_entries(pilot.app, "system-message"))
+        assert "secret-key" not in caplog.text

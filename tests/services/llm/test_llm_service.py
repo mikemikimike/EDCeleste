@@ -279,6 +279,43 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
         self.mock_stream_agent_response.assert_not_called()
         self.assertEqual(self.llm_service.history_turns, [])
 
+    async def test_failed_turn_redacts_key_from_message_status_and_traceback(self):
+        settings = _make_settings()
+        settings.llm.provider.api_key = "secret-key"
+        self.settings_service.get_settings.return_value = settings
+        self.llm_service.reload_service()
+
+        async def fail_after_reload(message: str):
+            changed = _make_settings()
+            changed.llm.provider.api_key = "new-key"
+            self.settings_service.get_settings.return_value = changed
+            self.llm_service.reload_service()
+            try:
+                raise ValueError("cause secret-key")
+            except ValueError as cause:
+                raise RuntimeError("rejected secret-key") from cause
+            yield
+
+        self.mock_stream_agent_response.side_effect = fail_after_reload
+        self.llm_service.add_llm_request_to_queue("hello")
+        with self.assertLogs("edceleste.services.llm_service", "ERROR") as logs:
+            items = await self._collect_stream_items(3)
+
+        self.assertEqual(
+            items[1],
+            SystemMessage(content="LLM turn failed: rejected [REDACTED API KEY]"),
+        )
+        status = await _latest_status(self.llm_service)
+        self.assertEqual(
+            status,
+            ServiceStatus(
+                ServiceState.ERROR,
+                "The last request failed: rejected [REDACTED API KEY]",
+            ),
+        )
+        self.assertNotIn("secret-key", "\n".join(logs.output))
+        self.assertIn("cause [REDACTED API KEY]", "\n".join(logs.output))
+
     async def test_should_report_failed_turn_and_keep_serving_next_message(self):
         # A single broken turn cannot kill the stream - it is the only source of
         # data for COMMS.
@@ -404,6 +441,16 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(issue.field, "llm.provider.type")
         self.assertIn("groq", issue.message)
 
+    async def test_validate_settings_redacts_key_from_provider_build_error(self):
+        settings = _make_settings()
+        settings.llm.provider.api_key = "secret-key"
+        self.mock_build_provider.side_effect = RuntimeError("bad secret-key")
+        issue = await self.llm_service.validate_settings(settings)
+        assert issue is not None
+        self.assertEqual(
+            issue.message, "Cannot reach the LLM provider: bad [REDACTED API KEY]"
+        )
+
     async def test_fetch_model_names_is_empty_when_the_provider_has_no_listing(
         self,
     ):
@@ -421,6 +468,18 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
         result = await self.llm_service.fetch_available_model_names()
 
         self.assertEqual(result, ["openai/gpt-4o", "google/gemini-pro"])
+
+    async def test_fetch_model_names_redacts_key_from_exception_log(self):
+        provider = _make_settings().llm.provider
+        provider.api_key = "secret-key"
+        self.mock_build_provider.return_value.client.models.list = AsyncMock(
+            side_effect=RuntimeError("bad secret-key")
+        )
+        with self.assertLogs("edceleste.services.llm_service", "ERROR") as logs:
+            result = await self.llm_service.fetch_available_model_names(provider)
+        self.assertEqual(result, [])
+        self.assertNotIn("secret-key", "\n".join(logs.output))
+        self.assertIn("[REDACTED API KEY]", "\n".join(logs.output))
 
     # --- status for the app header ---
 
@@ -514,6 +573,18 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
         last_status = statuses[-1]
         self.assertTrue(last_status.completed)
         self.assertEqual(last_status.message, "agent unreachable")
+
+    async def test_cold_start_redacts_key_when_building_agent_fails(self):
+        settings = _make_settings()
+        settings.llm.provider.api_key = "secret-key"
+        self.settings_service.get_settings.return_value = settings
+        self.mock_agent_class.side_effect = RuntimeError("bad secret-key")
+        statuses = [status async for status in self.llm_service.cold_start()]
+        self.assertEqual(statuses[-1].message, "bad [REDACTED API KEY]")
+        self.assertEqual(
+            await _latest_status(self.llm_service),
+            ServiceStatus(ServiceState.ERROR, "bad [REDACTED API KEY]"),
+        )
 
     async def test_find_connection_error_redacts_api_keys_from_provider_errors(self):
         provider = _make_settings().llm.provider
@@ -1016,6 +1087,42 @@ class TestLLMServiceHistory(unittest.IsolatedAsyncioTestCase):
             await self._ask("Hello")
 
         self.assertEqual(self.llm_service.history_turns, [])
+
+    async def test_provider_failure_is_redacted_through_the_real_agent(self):
+        settings = _make_settings()
+        settings.llm.provider.api_key = "secret-key"
+        self.llm_service._LLMService__settings_service.get_settings.return_value = (
+            settings
+        )
+
+        async def reject(messages: list, info: AgentInfo):
+            raise RuntimeError("401 secret-key")
+            yield
+
+        with patch.object(
+            LLMService,
+            "_LLMService__build_model",
+            return_value=FunctionModel(stream_function=reject),
+        ):
+            self.llm_service.reload_service()
+        self.llm_service.add_llm_request_to_queue("hello")
+        stream = self.llm_service.consume_llm_queue()
+        try:
+            with self.assertLogs("edceleste.services.llm_service", "ERROR") as logs:
+                items = [await stream.__anext__() for _ in range(3)]
+        finally:
+            await stream.aclose()
+
+        self.assertEqual(
+            items[1], SystemMessage(content="LLM turn failed: 401 [REDACTED API KEY]")
+        )
+        self.assertEqual(
+            await _latest_status(self.llm_service),
+            ServiceStatus(
+                ServiceState.ERROR, "The last request failed: 401 [REDACTED API KEY]"
+            ),
+        )
+        self.assertNotIn("secret-key", "\n".join(logs.output))
 
     async def test_should_keep_tool_calls_and_their_results_in_the_history(self):
         llm_service = LLMService(

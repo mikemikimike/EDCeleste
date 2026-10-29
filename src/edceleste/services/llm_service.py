@@ -2,6 +2,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 import logging
 import asyncio
+import traceback
 
 from edceleste.services.models.cold_start_status import ColdStartStatus
 from edceleste.services.models.message_block import (
@@ -123,6 +124,7 @@ class LLMService:
         self.history_turns: list[list[ModelMessage]] = []
         self.game_state: str | None = None
         self.__agent: Agent | None = None
+        self.__agent_api_key = ""
 
         self.__settings_service = settings_service
         self.__event_bus = event_bus
@@ -171,17 +173,12 @@ class LLMService:
 
             return
 
-        try:
-            async for response in self.__stream_agent_response(message):
-                yield response
+        async for response in self.__stream_agent_response(message):
+            yield response
 
-                # Speaking blocks the turn, so the text reaches COMMS first.
-                if isinstance(response, AgentText):
-                    await self.__event_bus.publish(TTSEvent(response.content))
-
-        except Exception as e:
-            logger.error("Error while processing LLM response: %s", e)
-            raise e
+            # Speaking blocks the turn, so the text reaches COMMS first.
+            if isinstance(response, AgentText):
+                await self.__event_bus.publish(TTSEvent(response.content))
 
     def __build_game_state_instructions(self) -> str:
         """Returns the "Current game state is:" heading on its own line and the
@@ -349,7 +346,8 @@ class LLMService:
             return SettingsIssueModel(
                 section="llm",
                 field="llm.provider.type",
-                message=f"Cannot reach the LLM provider: {error}",
+                message="Cannot reach the LLM provider: "
+                + self._redact_api_key(str(error), new_settings.llm.provider.api_key),
             )
 
         if available_models and new_settings.llm.provider.model not in available_models:
@@ -381,6 +379,7 @@ class LLMService:
             ],
             tools=self.__build_tools(),
         )
+        self.__agent_api_key = settings.llm.provider.api_key
 
     async def queue_reply_to_journal_event(self, event: EventReactionEvent) -> None:
         """Puts a prompt with the journal event as JSON into the LLM queue.
@@ -493,15 +492,18 @@ class LLMService:
 
             yield LLMStatus.THINKING
 
+            api_key = self.__agent_api_key
             try:
                 async for response in self.__run_turn_and_speak_reply(message):
                     yield response
             except Exception as error:
-                logger.exception(f"LLM turn failed: {error}", exc_info=error)
+                error_text = self._redact_api_key(str(error), api_key)
+                trace = self._redact_api_key(traceback.format_exc(), api_key)
+                logger.error("LLM turn failed: %s\n%s", error_text, trace)
                 self.__status_stream.set_status(
-                    ServiceState.ERROR, f"The last request failed: {error}"
+                    ServiceState.ERROR, f"The last request failed: {error_text}"
                 )
-                yield SystemMessage(content=f"LLM turn failed: {error}")
+                yield SystemMessage(content=f"LLM turn failed: {error_text}")
             else:
                 self.__status_stream.set_status(
                     ServiceState.OK, "The last request succeeded"
@@ -533,7 +535,14 @@ class LLMService:
 
             models = await client.models.list()  # type: ignore
         except Exception as e:
-            logger.exception(f"Failed to fetch models: {e}", exc_info=e)
+            trace = self._redact_api_key(
+                traceback.format_exc(), provider_settings.api_key
+            )
+            logger.error(
+                "Failed to fetch models: %s\n%s",
+                self._redact_api_key(str(e), provider_settings.api_key),
+                trace,
+            )
             return []
 
         return [model.id for model in models.data]
@@ -558,17 +567,19 @@ class LLMService:
         )
         yield status
 
+        api_key = self.__agent_api_key
         try:
+            provider_settings = self.__settings_service.get_settings().llm.provider
+            api_key = provider_settings.api_key
             self.reload_service()
             # Same check as the Test connection button in settings.
-            provider_settings = self.__settings_service.get_settings().llm.provider
             status.message = await self.find_connection_error(provider_settings)
             self.__set_status_after_connection_test(status.message)
             status.completed = True
             yield status
         except Exception as e:
             status.completed = True
-            status.message = str(e)
+            status.message = self._redact_api_key(str(e), api_key)
             self.__set_status_after_connection_test(status.message)
             yield status
 
@@ -625,16 +636,15 @@ class LLMService:
         except Exception as e:
             error_message = str(e)
 
-        if provider_settings.api_key:
-            # If there is any chance the API key appears in the error message,
-            # redact it.
-            error_message = error_message.replace(
-                provider_settings.api_key, "[REDACTED API KEY]"
-            )
+        error_message = self._redact_api_key(error_message, provider_settings.api_key)
 
         error_message = error_message[:MAX_REASON]
 
         return error_message
+
+    @staticmethod
+    def _redact_api_key(text: str, api_key: str) -> str:
+        return text.replace(api_key, "[REDACTED API KEY]") if api_key else text
 
     @staticmethod
     def _extract_error_message_from_provider_response(
